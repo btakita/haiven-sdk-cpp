@@ -28,13 +28,24 @@ Do not edit the generated headers; rerun `make emit`.
 
 ## Quickstart
 
-Install the package, or add it from a checkout:
+Clone the header-only SDK into your project.
+
+```sh
+git clone https://github.com/haiven-dev/haiven-sdk-cpp.git third_party/haiven-sdk-cpp
+git -C third_party/haiven-sdk-cpp checkout --detach 44480a20eeb40045505a81ef6b0c8240b1183dec
+```
+
+Add the source to your `CMakeLists.txt`. Replace `game` with your target name.
 
 ```cmake
-find_package(haiven CONFIG REQUIRED)     # after: cmake -S sdks/cpp -B build && cmake --install build
-# or: add_subdirectory(path/to/this/directory)
+add_subdirectory(third_party/haiven-sdk-cpp)
 target_link_libraries(game PRIVATE haiven::haiven)
 ```
+
+For a CMake installation, configure and install from the checkout with
+`cmake -S third_party/haiven-sdk-cpp -B build/haiven` and
+`cmake --install build/haiven --prefix ./third_party/haiven`. Point
+`CMAKE_PREFIX_PATH` at that prefix and use `find_package(haiven CONFIG REQUIRED)`.
 
 The SDK never opens a socket. Implement `Haiven::IHttpTransport` and
 `Haiven::IWebSocketTransport` over the networking your game already has
