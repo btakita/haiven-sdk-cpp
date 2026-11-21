@@ -233,7 +233,7 @@ def cli(source: Path, output: Path, work: Path, version: str) -> None:
                         destination, cwd=source, HAIVEN_DOWNLOAD_BASE=download_base)
                 executable = destination / "haiven"
             receipt = subprocess.check_output((str(executable), "version", "--json"), cwd=source, stderr=sys.stderr)
-            if json.loads(receipt).get("version") != version:
+            if json.loads(receipt)["data"]["version"] != version:
                 raise ValueError("installed CLI version differs from the approved release")
         finally:
             server.shutdown()
