@@ -14,30 +14,25 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import traceback
 import urllib.request
 import zipfile
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from typing import TypedDict
 
-SOURCES = {
-    "dotnet": "haiven-sdk-dotnet",
-    "unity-core": "haiven-sdk-unity",
-    "godot-dotnet": "haiven-sdk-godot",
-    "godot-demo": "haiven-sdk-godot-demo",
-    "cpp": "haiven-sdk-cpp",
-    "bossroom": "haiven-sdk-unity-bossroom",
-    "unreal": "haiven-sdk-unreal",
-    "lyra": "haiven-sdk-unreal-lyra",
-    "unreal-chat": "haiven-sdk-unreal-chat",
-}
-CLI_REPOSITORY_ID = 1464751838
 HOSTED = frozenset(("dotnet", "unity-core", "godot-dotnet", "godot-demo", "cpp", "cli"))
+LICENSED = frozenset(("bossroom", "unreal", "lyra", "unreal-chat"))
 MANAGED = frozenset(("dotnet", "unity-core", "godot-dotnet"))
 HOSTS = {"linux": "linux-x64", "win32": "windows-x64", "darwin": "macos"}
 RUNNERS = {"linux-x64": "ubuntu-24.04", "windows-x64": "windows-2025", "macos": "macos-15"}
 SHA = re.compile(r"[0-9a-f]{40}")
+DIGEST = re.compile(r"[0-9a-f]{64}")
+CARRIER_PATH = ".haiven-shadow.age"
+PATCH_HEADER = b"haiven-shadow-diff:v1 "
+MAX_CIPHERTEXT = 95 * 1024**2
 IDENTIFIER = re.compile(r"[1-9][0-9]{0,19}")
 RECIPIENT = re.compile(r"age1[0-9a-z]{58}")
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?")
@@ -73,47 +68,72 @@ def platforms(target: str) -> tuple[str, ...]:
     return ("portable",) if target in MANAGED else tuple(RUNNERS)
 
 
-def request(data: str, *, private: bool = False) -> dict[str, str]:
+class SourceDiff(TypedDict):
+    carrier: str
+    base: str
+    sha256: str
+
+
+class BuildRequest(TypedDict):
+    target: str
+    builder_sha: str
+    workflow_sha: str | None
+    source: SourceDiff
+    dotnet: SourceDiff | None
+    request_id: str
+    recipient: str
+
+
+def require_diff(raw: object) -> SourceDiff:
+    if (
+        not isinstance(raw, dict)
+        or raw.keys() != {"carrier", "base", "sha256"}
+        or not all(isinstance(value, str) for value in raw.values())
+        or not SHA.fullmatch(raw["carrier"])
+        or not SHA.fullmatch(raw["base"])
+        or raw["carrier"] == raw["base"]
+        or not DIGEST.fullmatch(raw["sha256"])
+    ):
+        raise ValueError("invalid encrypted diff descriptor")
+    return raw
+
+
+def request(data: str, *, private: bool = False) -> BuildRequest:
     raw = json.loads(data)
     if not isinstance(raw, dict) or set(raw) != {
-        "target", "source_sha", "dotnet_sha", "version", "request_id", "recipient"
-    } or any(not isinstance(value, str) for value in raw.values()):
+        "target", "builder_sha", "workflow_sha", "source", "dotnet", "request_id", "recipient"
+    } or not all(isinstance(raw[name], str) for name in ("target", "builder_sha", "request_id", "recipient")):
         raise ValueError("invalid build request")
     target = raw["target"]
     companion = target in {"unity-core", "godot-dotnet"}
     if (
-        target not in (SOURCES.keys() | {"cli"} if private else HOSTED)
-        or not SHA.fullmatch(raw["source_sha"])
-        or (not SHA.fullmatch(raw["dotnet_sha"]) if companion else raw["dotnet_sha"] != "")
+        target not in (LICENSED if private else HOSTED)
+        or not SHA.fullmatch(raw["builder_sha"])
+        or (
+            raw["workflow_sha"] is not None if private
+            else not isinstance(raw["workflow_sha"], str) or not SHA.fullmatch(raw["workflow_sha"])
+        )
         or not IDENTIFIER.fullmatch(raw["request_id"])
         or not RECIPIENT.fullmatch(raw["recipient"])
-        or (not VERSION.fullmatch(raw["version"]) if target == "cli" else raw["version"] != "")
+        or companion != (raw["dotnet"] is not None)
     ):
         raise ValueError("invalid build request")
+    require_diff(raw["source"])
+    if companion:
+        require_diff(raw["dotnet"])
     return raw
-
-
-def public_repository(target: str) -> str:
-    if target != "cli":
-        return f"haiven-dev/{SOURCES[target]}"
-    # Resolve the pinned canonical repository even if its public name changes.
-    url = f"https://api.github.com/repositories/{CLI_REPOSITORY_ID}"
-    request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
-    with urllib.request.urlopen(request, timeout=20) as response:
-        repository = json.load(response)
-    name = repository.get("full_name", "")
-    if (
-        repository.get("id") != CLI_REPOSITORY_ID
-        or repository.get("visibility") != "public"
-        or not re.fullmatch(r"haiven-dev/[A-Za-z0-9_.-]+", name)
-    ):
-        raise ValueError("CLI source repository differs from the approved public repository")
-    return name
 
 
 def plan(data: str) -> None:
     values = request(data)
     target = values["target"]
+    if (
+        target != os.environ["EXPECTED_TARGET"]
+        or values["workflow_sha"] != os.environ["GITHUB_SHA"]
+        or values["source"]["base"] != values["workflow_sha"]
+    ):
+        raise ValueError("request differs from this destination workflow")
+    require_builder(values["builder_sha"])
     matrix = {
         "include": [
             {"platform": platform, "runner": RUNNERS.get(platform, "ubuntu-24.04")}
@@ -121,9 +141,10 @@ def plan(data: str) -> None:
         ]
     }
     with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
-        for name in ("target", "source_sha", "dotnet_sha", "request_id"):
+        for name in ("target", "request_id"):
             print(f"{name}={values[name]}", file=output)
-        print(f"repository={public_repository(target)}", file=output)
+        print(f"base_sha={values['source']['base']}", file=output)
+        print(f"dotnet_base={values['dotnet']['base'] if values['dotnet'] else ''}", file=output)
         print(f"matrix={json.dumps(matrix, separators=(',', ':'))}", file=output)
 
 
@@ -146,10 +167,131 @@ def command(*args: str | Path, cwd: Path, **environment: str) -> None:
     )
 
 
-def require_checkout(source: Path, sha: str) -> None:
-    actual = subprocess.check_output(("git", "rev-parse", "HEAD"), cwd=source, text=True, stderr=sys.stderr)
-    if actual.strip() != sha:
-        raise ValueError("checkout does not match approved public commit")
+def git(source: Path, *args: str, **kwargs: object) -> bytes:
+    return subprocess.run(
+        ("git", "-c", f"core.hooksPath={os.devnull}", *args),
+        cwd=source,
+        capture_output=True,
+        check=True,
+        **kwargs,
+    ).stdout
+
+
+def restore_source(source: Path, diff: SourceDiff, request_id: str, identity: str) -> str:
+    base, carrier = diff["base"], diff["carrier"]
+    if (
+        git(source, "rev-parse", "HEAD").decode().strip() != base
+        or git(source, "status", "--porcelain", "--untracked-files=all")
+        or git(source, "ls-remote", "--exit-code", "origin", "refs/heads/main")
+        != f"{base}\trefs/heads/main\n".encode()
+        or git(source, "ls-remote", "--exit-code", "origin", f"refs/heads/ci/preview/{request_id}")
+        != f"{carrier}\trefs/heads/ci/preview/{request_id}\n".encode()
+    ):
+        raise ValueError("shadow ref or public base differs from the approved request")
+    git(source, "fetch", "--no-tags", "--depth=2", "origin", carrier)
+    commit = git(source, "cat-file", "commit", carrier).split(b"\n\n", 1)[0].splitlines()
+    parents = [entry for entry in commit if entry.startswith(b"parent ")]
+    changes = git(source, "diff-tree", "--name-status", "-z", "--no-renames", "-r", base, carrier)
+    entry = git(source, "ls-tree", carrier, "--", CARRIER_PATH)
+    if (
+        parents != [f"parent {base}".encode()]
+        or changes != f"A\0{CARRIER_PATH}\0".encode()
+        or not entry.startswith(b"100644 blob ")
+    ):
+        raise ValueError("carrier must contain only one encrypted diff above the approved base")
+
+    blob = f"{carrier}:{CARRIER_PATH}"
+    size = int(git(source, "cat-file", "-s", blob))
+    if not 0 < size <= MAX_CIPHERTEXT:
+        raise ValueError("invalid shadow ciphertext size")
+    ciphertext = git(source, "cat-file", "blob", blob)
+    if (
+        not ciphertext.startswith(b"age-encryption.org/v1\n")
+        or hashlib.sha256(ciphertext).hexdigest() != diff["sha256"]
+    ):
+        raise ValueError("shadow ciphertext digest differs from the approved request")
+
+    with tempfile.TemporaryDirectory(prefix="haiven-shadow-") as temporary:
+        encrypted = Path(temporary) / CARRIER_PATH
+        encrypted.write_bytes(ciphertext)
+        with tempfile.TemporaryFile(mode="w+b", buffering=0, dir=temporary) as plaintext:
+            result = subprocess.run(
+                ("age", "--decrypt", "--identity", "-", str(encrypted)),
+                input=(identity.rstrip() + "\n").encode(),
+                stdout=plaintext,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if result.returncode:
+                raise ValueError("could not decrypt the approved source diff")
+            plaintext.seek(0)
+            header = plaintext.readline(len(PATCH_HEADER) + 42)
+            tree = header.removeprefix(PATCH_HEADER).rstrip(b"\n").decode("ascii")
+            if header != PATCH_HEADER + tree.encode() + b"\n" or not SHA.fullmatch(tree):
+                raise ValueError("invalid encrypted source diff header")
+            offset = plaintext.tell()
+            if plaintext.read(1):
+                plaintext.seek(offset)
+                git(source, "apply", "--cached", "--whitespace=nowarn", "-", stdin=plaintext)
+
+    actual = git(source, "write-tree").decode().strip()
+    paths = git(source, "ls-tree", "-r", "-z", actual).split(b"\0")
+    if (
+        actual != tree
+        or any(row and row.split(b" ", 1)[0] not in {b"100644", b"100755"} for row in paths)
+        or git(source, "ls-tree", actual, "--", CARRIER_PATH)
+    ):
+        raise ValueError("reconstructed tree differs from the approved source")
+    epoch = git(source, "show", "-s", "--format=%ct", base).decode().strip()
+    date = f"@{epoch} +0000"
+    revision = git(
+        source,
+        "-c", "user.name=Haiven Shadow Build",
+        "-c", "user.email=shadow-build@users.noreply.github.com",
+        "commit-tree", tree, "-p", base, "-m", "Reconstruct approved shadow source",
+        env={**os.environ, "GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date},
+    ).decode().strip()
+    git(
+        source,
+        "-c", "filter.lfs.smudge=",
+        "-c", "filter.lfs.process=",
+        "-c", "filter.lfs.required=false",
+        "-c", "core.autocrlf=false",
+        "reset", "--hard", revision,
+    )
+    return tree
+
+
+def require_builder(sha: str) -> None:
+    tooling = Path(__file__).resolve().parents[2]
+    if git(tooling, "rev-parse", "HEAD").decode().strip() != sha:
+        raise ValueError("request requires the approved shared builder revision")
+
+
+def reconstruct(args: argparse.Namespace) -> None:
+    values = request(args.request, private=args.licensed)
+    if args.licensed != (values["target"] not in HOSTED):
+        raise ValueError("incorrect runner class")
+    identity = os.environ.pop("SDK_SHADOW_SOURCE_AGE_IDENTITY", "")
+    require_builder(values["builder_sha"])
+    if not identity.strip():
+        raise ValueError("protected source identity is unavailable")
+    trees = {"source": restore_source(args.source, values["source"], values["request_id"], identity),
+             "dotnet": None}
+    if values["dotnet"] is not None:
+        trees["dotnet"] = restore_source(args.dotnet, values["dotnet"], values["request_id"], identity)
+    with args.verification.open("x", encoding="utf-8") as verification:
+        json.dump(trees, verification)
+
+
+def require_tree(source: Path, tree: str) -> None:
+    if (
+        not SHA.fullmatch(tree)
+        or git(source, "rev-parse", "HEAD^{tree}").decode().strip() != tree
+        or git(source, "write-tree").decode().strip() != tree
+        or git(source, "status", "--porcelain", "--untracked-files=all")
+    ):
+        raise ValueError("checkout no longer matches the reconstructed tree")
 
 
 def managed(target: str, source: Path, dotnet: Path, output: Path, work: Path) -> None:
@@ -290,7 +432,7 @@ def godot_demo(source: Path, output: Path, work: Path, platform: str) -> None:
             check=False, cwd=source, env={**os.environ, "NO_COLOR": "1"},
         )
         print(result.stdout)
-        if result.returncode or re.search(r"^(?:SCRIPT ERROR|ERROR):", result.stdout, re.M):
+        if result.returncode or re.search(r"^(?:SCRIPT ERROR|ERROR):", result.stdout, re.MULTILINE):
             raise ValueError("Godot export failed")
     if platform == "macos":
         unpacked = work / "smoke"
@@ -309,7 +451,7 @@ def godot_demo(source: Path, output: Path, work: Path, platform: str) -> None:
     command(executable, "--headless", "--quit-after", "120", "--log-file", log, cwd=executable.parent)
     diagnostics = log.read_text(encoding="utf-8", errors="replace")
     print(diagnostics)
-    if "Godot Engine v" not in diagnostics or re.search(r"^(?:SCRIPT ERROR|ERROR):", diagnostics, re.M):
+    if "Godot Engine v" not in diagnostics or re.search(r"^(?:SCRIPT ERROR|ERROR):", diagnostics, re.MULTILINE):
         raise ValueError("Godot player launch failed")
 
 
@@ -403,26 +545,34 @@ def build(args: argparse.Namespace) -> bool:
     output.mkdir()
     diagnostics = work / "build.log"
     checked = False
-    with diagnostics.open("w", encoding="utf-8") as log:
-        with redirect_stdout(log), redirect_stderr(log):
-            try:
-                require_checkout(source, values["source_sha"])
-                if values["dotnet_sha"]:
-                    require_checkout(dotnet, values["dotnet_sha"])
-                if target in MANAGED:
-                    managed(target, source, dotnet, output, work)
-                elif target == "cpp":
-                    cpp(source, output, work)
-                elif target == "cli":
-                    cli(source, output, work, values["version"])
-                elif target == "godot-demo":
-                    godot_demo(source, output, work, platform)
-                else:
-                    licensed(target, source, output, work, platform)
-                checked = True
-            except Exception:
-                traceback.print_exc()
+    with (
+        diagnostics.open("w", encoding="utf-8") as log,
+        redirect_stdout(log),
+        redirect_stderr(log),
+    ):
+        try:
+            trees = json.loads(args.verification.read_bytes())
+            require_tree(source, trees["source"])
+            if values["dotnet"] is not None:
+                require_tree(dotnet, trees["dotnet"])
+            if target in MANAGED:
+                managed(target, source, dotnet, output, work)
+            elif target == "cpp":
+                cpp(source, output, work)
+            elif target == "cli":
+                version = (source / "version.txt").read_text().strip()
+                if not VERSION.fullmatch(version):
+                    raise ValueError("invalid reconstructed CLI version")
+                cli(source, output, work, version)
+            elif target == "godot-demo":
+                godot_demo(source, output, work, platform)
+            else:
+                licensed(target, source, output, work, platform)
+            checked = True
+        except Exception:  # noqa: BLE001 - preserve failure details inside the encrypted report
+            traceback.print_exc()
     decision = {key: value for key, value in values.items() if key != "recipient"}
+    decision["trees"] = json.loads(args.verification.read_bytes())
     payload = work / "payload.tar.gz"
     if checked:
         # Keep package permissions, including internal app bundle links, inside
@@ -457,10 +607,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("plan")
+    source = sub.add_parser("reconstruct")
+    source.add_argument("--licensed", action="store_true")
+    for name in ("source", "dotnet", "verification"):
+        source.add_argument(f"--{name}", type=Path, required=True)
     builder = sub.add_parser("build")
     builder.add_argument("--platform", required=True)
     builder.add_argument("--licensed", action="store_true")
-    for name in ("source", "dotnet", "work", "bundle"):
+    for name in ("source", "dotnet", "work", "bundle", "verification"):
         builder.add_argument(f"--{name}", type=Path, required=True)
     args = parser.parse_args()
     args.request = os.environ.get("SHADOW_REQUEST", "")
@@ -468,8 +622,12 @@ def main() -> int:
         if args.command == "plan":
             plan(args.request)
             return 0
+        if args.command == "reconstruct":
+            reconstruct(args)
+            print("Approved encrypted source diff reconstructed.")
+            return 0
         return 0 if build(args) else 1
-    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         print("Could not prepare or seal the shadow build.", file=sys.stderr)
         return 1
 
