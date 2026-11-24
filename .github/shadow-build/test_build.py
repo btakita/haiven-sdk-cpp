@@ -27,6 +27,7 @@ def make_key(path):
 def make_request(recipient="age1" + "p" * 58):
     return {
         "target": "cpp",
+        "lane": "main",
         "builder_sha": "c" * 40,
         "workflow_sha": "b" * 40,
         "source": {"carrier": "a" * 40, "base": "b" * 40, "sha256": "d" * 64},
@@ -45,12 +46,17 @@ class ShadowBuildTests(unittest.TestCase):
             {"builder_sha": "main"}, {"target": "dotnet", "dotnet": request["source"]},
             {"target": "unity-core"}, {"target": "bossroom", "workflow_sha": None},
             {"target": "godot"}, {"version": "main"}, {"recipient": "AGE-SECRET-KEY-EXAMPLE"},
+            {"lane": "shadow-source"}, {"lane": None}, {"lane": "pr"},
         ):
             with self.subTest(replace=replace), self.assertRaises(ValueError):
                 build.request(json.dumps({**request, **replace}))
         for target in sorted(build.LICENSED):
             licensed = {**request, "target": target}
             self.assertEqual(build.request(json.dumps(licensed)), licensed)
+        missing = dict(request)
+        del missing["lane"]
+        with self.assertRaises(ValueError):
+            build.request(json.dumps(missing))
 
     def test_licensed_placement_uses_pinned_engines_or_named_runners(self):
         variables = {name: "" for name in build.RUNNER_VARIABLES.values()}
@@ -91,6 +97,10 @@ class ShadowBuildTests(unittest.TestCase):
     def test_cpp_workflow_is_dispatch_only_and_read_only(self):
         root = Path(__file__).resolve().parents[2]
         workflow = (root / ".github/workflows/shadow-build.yml").read_text()
+        # The source key comes from the environment the request's lane selects.
+        self.assertIn("      environment: ${{ steps.plan.outputs.environment }}\n", workflow)
+        self.assertIn("    environment: ${{ needs.request.outputs.environment }}\n", workflow)
+        self.assertNotIn("environment: shadow-source", workflow)
         self.assertRegex(workflow, r"on:\n  workflow_dispatch:")
         self.assertRegex(workflow, r"permissions:\n  contents: read\n\n")
         self.assertIn("EXPECTED_TARGET: 'cpp'", workflow)
@@ -104,6 +114,10 @@ class ShadowBuildTests(unittest.TestCase):
             with patch.dict(build.os.environ, env), patch.object(build, "require_builder"):
                 build.plan(json.dumps(request))
                 self.assertIn("base_sha=" + "b" * 40, output.read_text())
+                self.assertIn("environment=shadow-source\n", output.read_text())
+                output.write_text("")
+                build.plan(json.dumps({**request, "lane": "pull_request"}))
+                self.assertIn("environment=shadow-source-pr\n", output.read_text())
                 self.assertIn('"runner":"windows-2025","image":""', output.read_text())
                 for change in (
                     {**request, "target": "cli"},

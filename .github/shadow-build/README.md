@@ -25,6 +25,7 @@ The workflow accepts the positive decimal correlation ID as a
 | --- | --- |
 | `request_id` | Same correlation ID as the workflow input |
 | `target` | `cpp` in this workflow |
+| `lane` | `main` for a commit on the caller's protected `main`, or `pull_request` for the head of an unmerged pull request |
 | `builder_sha` | Reviewed shared builder revision |
 | `workflow_sha` | Reviewed revision of this workflow on protected `main` |
 | `source` | Object with `base`, `carrier`, and ciphertext `sha256` |
@@ -35,11 +36,24 @@ The workflow accepts the positive decimal correlation ID as a
 
 Set `SDK_SHADOW_BUILDER_SHA` to the reviewed common builder commit.
 Set `SDK_SHADOW_DISPATCH_ACTOR_ID` to the allowed GitHub App bot's numeric
-account ID. Add the source age identity as the environment secret
-`SDK_SHADOW_SOURCE_AGE_IDENTITY` in the `shadow-source` environment. Restrict
-the environment to `main` and require an independent deployment reviewer.
-Disable administrative bypass. Keep the identity in this environment
-and use a distinct identity for decrypting outputs. [GitHub environments](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
+account ID. The build job runs in the environment the request's `lane`
+selects, and each holds its own source age identity as the environment
+secret `SDK_SHADOW_SOURCE_AGE_IDENTITY`:
+
+| Lane | Environment | Decrypts |
+| --- | --- | --- |
+| `main` | `shadow-source` | diffs staged from the caller's protected `main` |
+| `pull_request` | `shadow-source-pr` | diffs staged from unmerged pull-request heads |
+
+A pull-request build runs unmerged code in the same job that decrypted its
+source, and a hosted runner gives that code root. It could read the
+identity from the runner's memory, and ciphertext stays fetchable by SHA
+after its ref is deleted. The separate identity limits that leak to other
+pull-request stages for this target; it never opens a diff staged from
+`main`. Restrict both environments to `main` and require an independent
+deployment reviewer. Disable administrative bypass. Keep each identity in
+its environment and use a distinct identity for decrypting outputs.
+[GitHub environments](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
 
 The reconstruction step verifies the exact public base, carrier and digest.
 It applies the authenticated diff to a clean index and checks the expected
@@ -63,14 +77,14 @@ platform job:
 - **Boss Room** runs Unity `6000.0.52f1` in GameCI's editor image for each
   player's build module, pinned by digest.
   [GameCI images](https://game.ci/docs/docker/docker-images)
-  The `shadow-source` environment holds `UNITY_EMAIL`, `UNITY_PASSWORD`,
+  Both source environments hold `UNITY_EMAIL`, `UNITY_PASSWORD`,
   and either `UNITY_LICENSE` (the contents of a Personal `.ulf` file) or
   `UNITY_SERIAL` (a Plus or Pro serial, returned after the build).
   [GameCI activation](https://game.ci/docs/github/activation)
 - **Unreal plugin and Unreal Chat** on Linux install Unreal Engine `5.8.2`
   from Epic's `dev-slim` image, pinned by digest. Only the engine
   directory is extracted onto the runner's `/mnt` disk. `EPIC_GHCR_TOKEN`
-  in `shadow-source` is a token for a GitHub account linked to Epic, with
+  in both source environments is a token for a GitHub account linked to Epic, with
   `read:packages`. Epic's image terms follow the Unreal Engine EULA, so the
   workflow never uploads or republishes the engine.
   [Unreal Engine containers](https://dev.epicgames.com/documentation/en-us/unreal-engine/overview-of-containers-in-unreal-engine)
@@ -84,7 +98,9 @@ platform job:
   fails and names the variable when it is unset.
 
 The engine secrets reach only the step that installs or activates the
-engine, never the reconstruction or build steps. A Unity serial is returned
+engine, never the reconstruction or build steps. A pull-request build can
+still reach an active engine licence, so `shadow-source-pr` may hold
+separate engine credentials. A Unity serial is returned
 in an `always()` step. The build step still runs approved project code
 while the Unity licence is active.
 

@@ -54,6 +54,11 @@ RUNNER_VARIABLES = {
     "windows-x64": "SDK_SHADOW_RUNNER_WINDOWS_X64",
     "macos": "SDK_SHADOW_RUNNER_MACOS",
 }
+# The request's lane picks the environment, and so the source key, that the
+# build job decrypts with. Unmerged pull-request code runs in the same job as
+# its decrypted source, so pull-request stages use their own key per target:
+# a key that code leaks cannot open a diff staged from `main`.
+SOURCE_ENVIRONMENTS = {"main": "shadow-source", "pull_request": "shadow-source-pr"}
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 SHA = re.compile(r"[0-9a-f]{40}")
 DIGEST = re.compile(r"[0-9a-f]{64}")
@@ -126,6 +131,7 @@ class SourceDiff(TypedDict):
 
 class BuildRequest(TypedDict):
     target: str
+    lane: str
     builder_sha: str
     workflow_sha: str | None
     source: SourceDiff
@@ -151,13 +157,16 @@ def require_diff(raw: object) -> SourceDiff:
 def request(data: str) -> BuildRequest:
     raw = json.loads(data)
     if not isinstance(raw, dict) or set(raw) != {
-        "target", "builder_sha", "workflow_sha", "source", "dotnet", "request_id", "recipient"
-    } or not all(isinstance(raw[name], str) for name in ("target", "builder_sha", "request_id", "recipient")):
+        "target", "lane", "builder_sha", "workflow_sha", "source", "dotnet", "request_id", "recipient"
+    } or not all(
+        isinstance(raw[name], str) for name in ("target", "lane", "builder_sha", "request_id", "recipient")
+    ):
         raise ValueError("invalid build request")
     target = raw["target"]
     companion = target in {"unity-core", "godot-dotnet"}
     if (
         target not in TARGETS
+        or raw["lane"] not in SOURCE_ENVIRONMENTS
         or not SHA.fullmatch(raw["builder_sha"])
         or not isinstance(raw["workflow_sha"], str)
         or not SHA.fullmatch(raw["workflow_sha"])
@@ -190,6 +199,7 @@ def plan(data: str) -> None:
     with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
         for name in ("target", "request_id"):
             print(f"{name}={values[name]}", file=output)
+        print(f"environment={SOURCE_ENVIRONMENTS[values['lane']]}", file=output)
         print(f"base_sha={values['source']['base']}", file=output)
         print(f"dotnet_base={values['dotnet']['base'] if values['dotnet'] else ''}", file=output)
         print(f"matrix={json.dumps(matrix, separators=(',', ':'))}", file=output)
