@@ -43,13 +43,50 @@ class ShadowBuildTests(unittest.TestCase):
         for replace in (
             {"source": {"carrier": "refs/heads/main"}}, {"request_id": "123\nother=value"},
             {"builder_sha": "main"}, {"target": "dotnet", "dotnet": request["source"]},
-            {"target": "unity-core"}, {"target": "bossroom"}, {"version": "main"},
-            {"recipient": "AGE-SECRET-KEY-EXAMPLE"},
+            {"target": "unity-core"}, {"target": "bossroom", "workflow_sha": None},
+            {"target": "godot"}, {"version": "main"}, {"recipient": "AGE-SECRET-KEY-EXAMPLE"},
         ):
             with self.subTest(replace=replace), self.assertRaises(ValueError):
                 build.request(json.dumps({**request, **replace}))
-        licensed = {**request, "target": "bossroom", "workflow_sha": None}
-        self.assertEqual(build.request(json.dumps(licensed), private=True), licensed)
+        for target in sorted(build.LICENSED):
+            licensed = {**request, "target": target}
+            self.assertEqual(build.request(json.dumps(licensed)), licensed)
+
+    def test_licensed_placement_uses_pinned_engines_or_named_runners(self):
+        variables = {name: "" for name in build.RUNNER_VARIABLES.values()}
+        with patch.dict(build.os.environ, variables):
+            for platform, image in build.UNITY_IMAGES.items():
+                self.assertIn(build.UNITY_VERSION, image)
+                self.assertRegex(image, r"@sha256:[0-9a-f]{64}$")
+                self.assertEqual(build.placement("bossroom", platform), ("ubuntu-24.04", image))
+                self.assertEqual(build.host("bossroom", platform), "linux-x64")
+            self.assertRegex(build.UNREAL_IMAGE, r"dev-slim-5\.8\.2@sha256:[0-9a-f]{64}$")
+            for target in ("unreal", "unreal-chat"):
+                self.assertEqual(
+                    build.placement(target, "linux-x64"), ("ubuntu-24.04", build.UNREAL_IMAGE)
+                )
+            for target, platform in (
+                ("unreal", "windows-x64"), ("unreal-chat", "macos"), ("lyra", "linux-x64"),
+            ):
+                with self.subTest(target=target, platform=platform), self.assertRaises(ValueError):
+                    build.placement(target, platform)
+            self.assertEqual(build.placement("cpp", "macos"), ("macos-15", ""))
+        named = {build.RUNNER_VARIABLES["windows-x64"]: "haiven-unreal-windows"}
+        with patch.dict(build.os.environ, named):
+            self.assertEqual(
+                build.placement("lyra", "windows-x64"), ("haiven-unreal-windows", "")
+            )
+            self.assertEqual(build.host("lyra", "windows-x64"), "windows-x64")
+        for label in ("", "a b", "x" * 101, "-flag", "label\nother=value"):
+            with patch.dict(build.os.environ, {build.RUNNER_VARIABLES["macos"]: label}):
+                with self.subTest(label=label), self.assertRaises(ValueError):
+                    build.placement("unreal", "macos")
+
+    def test_readme_names_the_engine_secrets_and_runner_variables(self):
+        root = Path(__file__).resolve().parents[2]
+        readme = (root / ".github/shadow-build/README.md").read_text()
+        for name in ("UNITY_LICENSE", "UNITY_SERIAL", "EPIC_GHCR_TOKEN", "SDK_SHADOW_RUNNER_MACOS"):
+            self.assertIn(name, readme)
 
     def test_cpp_workflow_is_dispatch_only_and_read_only(self):
         root = Path(__file__).resolve().parents[2]
@@ -67,6 +104,7 @@ class ShadowBuildTests(unittest.TestCase):
             with patch.dict(build.os.environ, env), patch.object(build, "require_builder"):
                 build.plan(json.dumps(request))
                 self.assertIn("base_sha=" + "b" * 40, output.read_text())
+                self.assertIn('"runner":"windows-2025","image":""', output.read_text())
                 for change in (
                     {**request, "target": "cli"},
                     {**request, "workflow_sha": "a" * 40},
@@ -101,7 +139,7 @@ class ShadowBuildTests(unittest.TestCase):
                          patch.object(build, "cpp", side_effect=compile_source), \
                          contextlib.redirect_stdout(stdout):
                         self.assertIs(build.build(argparse.Namespace(
-                            request=json.dumps(request), platform=platform, licensed=False,
+                            request=json.dumps(request), platform=platform,
                             source=root, dotnet=root, work=work, bundle=encrypted, verification=verification,
                         )), ok)
                     require.assert_called_once_with(root.resolve(), trees["source"])

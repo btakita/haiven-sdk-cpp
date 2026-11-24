@@ -27,7 +27,34 @@ HOSTED = frozenset(("dotnet", "unity-core", "godot-dotnet", "godot-demo", "cpp",
 LICENSED = frozenset(("bossroom", "unreal", "lyra", "unreal-chat"))
 MANAGED = frozenset(("dotnet", "unity-core", "godot-dotnet"))
 HOSTS = {"linux": "linux-x64", "win32": "windows-x64", "darwin": "macos"}
+TARGETS = HOSTED | LICENSED
 RUNNERS = {"linux-x64": "ubuntu-24.04", "windows-x64": "windows-2025", "macos": "macos-15"}
+UNITY_VERSION = "6000.0.52f1"
+# Boss Room cross-builds every desktop player on a standard Linux runner, in
+# GameCI's Unity editor image for that player's build module, pinned by digest.
+UNITY_IMAGES = {
+    "linux-x64": "unityci/editor:ubuntu-6000.0.52f1-linux-il2cpp-3"
+    "@sha256:b10c4080079be02e270f714b06bab863bfdd5e11d0dbfadfb7adf9417e711ae5",
+    "windows-x64": "unityci/editor:ubuntu-6000.0.52f1-windows-mono-3"
+    "@sha256:1111f4f20840232c36a362e8f73ebcff7828990fc2624d60662c286d3a0313a8",
+    "macos": "unityci/editor:ubuntu-6000.0.52f1-mac-mono-3"
+    "@sha256:69ae4ce9cfc92ae6ebac3b812e7335c6c3206a0a207701bad4ddfe7dd465e45b",
+}
+UNREAL_VERSION = "5.8.2"
+# Epic publishes a Linux development image only (linux/amd64 manifest digest).
+# The Unreal plugin and Unreal Chat build their Linux players from it on a
+# standard runner; Windows, macOS, and every Lyra player need a runner that
+# already holds the engine (and, for Lyra, the Fab content).
+UNREAL_IMAGE = (
+    "ghcr.io/epicgames/unreal-engine:dev-slim-5.8.2"
+    "@sha256:5d42f9f0f3f994143ff2a3b9c8b55ab91deed4b7c1eec213a20757664c3e2b28"
+)
+RUNNER_VARIABLES = {
+    "linux-x64": "SDK_SHADOW_RUNNER_LINUX_X64",
+    "windows-x64": "SDK_SHADOW_RUNNER_WINDOWS_X64",
+    "macos": "SDK_SHADOW_RUNNER_MACOS",
+}
+LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 SHA = re.compile(r"[0-9a-f]{40}")
 DIGEST = re.compile(r"[0-9a-f]{64}")
 CARRIER_PATH = ".haiven-shadow.age"
@@ -68,6 +95,29 @@ def platforms(target: str) -> tuple[str, ...]:
     return ("portable",) if target in MANAGED else tuple(RUNNERS)
 
 
+def host(target: str, platform: str) -> str:
+    """The runner platform that builds `platform`: Boss Room cross-builds on Linux."""
+    return "linux-x64" if target == "bossroom" and platform != "portable" else platform
+
+
+def placement(target: str, platform: str) -> tuple[str, str]:
+    """Return the runner label and engine image; no image means the runner holds the engine."""
+    if target == "bossroom":
+        return RUNNERS["linux-x64"], UNITY_IMAGES[platform]
+    if target in {"unreal", "unreal-chat"} and platform == "linux-x64":
+        return RUNNERS[platform], UNREAL_IMAGE
+    if target in LICENSED:
+        variable = RUNNER_VARIABLES[platform]
+        label = os.environ.get(variable, "")
+        if not LABEL.fullmatch(label):
+            raise ValueError(
+                f"set the {variable} repository variable to a runner that holds "
+                f"Unreal Engine {UNREAL_VERSION}"
+            )
+        return label, ""
+    return RUNNERS.get(platform, "ubuntu-24.04"), ""
+
+
 class SourceDiff(TypedDict):
     carrier: str
     base: str
@@ -98,7 +148,7 @@ def require_diff(raw: object) -> SourceDiff:
     return raw
 
 
-def request(data: str, *, private: bool = False) -> BuildRequest:
+def request(data: str) -> BuildRequest:
     raw = json.loads(data)
     if not isinstance(raw, dict) or set(raw) != {
         "target", "builder_sha", "workflow_sha", "source", "dotnet", "request_id", "recipient"
@@ -107,12 +157,10 @@ def request(data: str, *, private: bool = False) -> BuildRequest:
     target = raw["target"]
     companion = target in {"unity-core", "godot-dotnet"}
     if (
-        target not in (LICENSED if private else HOSTED)
+        target not in TARGETS
         or not SHA.fullmatch(raw["builder_sha"])
-        or (
-            raw["workflow_sha"] is not None if private
-            else not isinstance(raw["workflow_sha"], str) or not SHA.fullmatch(raw["workflow_sha"])
-        )
+        or not isinstance(raw["workflow_sha"], str)
+        or not SHA.fullmatch(raw["workflow_sha"])
         or not IDENTIFIER.fullmatch(raw["request_id"])
         or not RECIPIENT.fullmatch(raw["recipient"])
         or companion != (raw["dotnet"] is not None)
@@ -134,12 +182,11 @@ def plan(data: str) -> None:
     ):
         raise ValueError("request differs from this destination workflow")
     require_builder(values["builder_sha"])
-    matrix = {
-        "include": [
-            {"platform": platform, "runner": RUNNERS.get(platform, "ubuntu-24.04")}
-            for platform in platforms(target)
-        ]
-    }
+    rows = []
+    for platform in platforms(target):
+        runner, image = placement(target, platform)
+        rows.append({"platform": platform, "runner": runner, "image": image})
+    matrix = {"include": rows}
     with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
         for name in ("target", "request_id"):
             print(f"{name}={values[name]}", file=output)
@@ -269,9 +316,7 @@ def require_builder(sha: str) -> None:
 
 
 def reconstruct(args: argparse.Namespace) -> None:
-    values = request(args.request, private=args.licensed)
-    if args.licensed != (values["target"] not in HOSTED):
-        raise ValueError("incorrect runner class")
+    values = request(args.request)
     identity = os.environ.pop("SDK_SHADOW_SOURCE_AGE_IDENTITY", "")
     require_builder(values["builder_sha"])
     if not identity.strip():
@@ -480,7 +525,7 @@ def licensed(target: str, source: Path, output: Path, work: Path, platform: str)
     engine = executable_path("UNREAL_ENGINE_ROOT")
     installed = json.loads((engine / "Engine/Build/Build.version").read_text(encoding="utf-8-sig"))
     version = ".".join(str(installed[key]) for key in ("MajorVersion", "MinorVersion", "PatchVersion"))
-    if version != "5.8.2":
+    if version != UNREAL_VERSION:
         raise ValueError("installed Unreal Engine differs from the supported version")
     uat = engine / "Engine/Build/BatchFiles" / ("RunUAT.bat" if platform == "windows-x64" else "RunUAT.sh")
     unreal_platform = {"linux-x64": "Linux", "windows-x64": "Win64", "macos": "Mac"}[platform]
@@ -531,13 +576,13 @@ def portable_metadata(member: tarfile.TarInfo) -> tarfile.TarInfo:
 
 
 def build(args: argparse.Namespace) -> bool:
-    values = request(args.request, private=args.licensed)
+    values = request(args.request)
     target = values["target"]
     platform = args.platform
-    if platform not in platforms(target) or (platform != "portable" and HOSTS[sys.platform] != platform):
+    if platform not in platforms(target) or (
+        platform != "portable" and HOSTS[sys.platform] != host(target, platform)
+    ):
         raise ValueError("incorrect build platform")
-    if args.licensed != (target not in HOSTED):
-        raise ValueError("incorrect runner class")
     source, dotnet = args.source.resolve(), args.dotnet.resolve()
     work = args.work.resolve()
     work.mkdir()
@@ -608,12 +653,10 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("plan")
     source = sub.add_parser("reconstruct")
-    source.add_argument("--licensed", action="store_true")
     for name in ("source", "dotnet", "verification"):
         source.add_argument(f"--{name}", type=Path, required=True)
     builder = sub.add_parser("build")
     builder.add_argument("--platform", required=True)
-    builder.add_argument("--licensed", action="store_true")
     for name in ("source", "dotnet", "work", "bundle", "verification"):
         builder.add_argument(f"--{name}", type=Path, required=True)
     args = parser.parse_args()
