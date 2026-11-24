@@ -50,7 +50,9 @@ source, and a hosted runner gives that code root. It could read the
 identity from the runner's memory, and ciphertext stays fetchable by SHA
 after its ref is deleted. The separate identity limits that leak to other
 pull-request stages for this target; it never opens a diff staged from
-`main`. Restrict both environments to `main` and require an independent
+`main`, provided the two lanes never share a runner. Standard runners and
+the engine-image jobs start every job on a fresh VM. Named runners are
+separate per lane (see [Licensed engines](#licensed-engines)). Restrict both environments to `main` and require an independent
 deployment reviewer. Disable administrative bypass. Keep each identity in
 its environment and use a distinct identity for decrypting outputs.
 [GitHub environments](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
@@ -74,6 +76,11 @@ platform job:
 | Unreal plugin, Unreal Chat | `ubuntu-24.04` | `SDK_SHADOW_RUNNER_WINDOWS_X64` | `SDK_SHADOW_RUNNER_MACOS` |
 | Lyra | `SDK_SHADOW_RUNNER_LINUX_X64` | `SDK_SHADOW_RUNNER_WINDOWS_X64` | `SDK_SHADOW_RUNNER_MACOS` |
 
+The table names the `main` lane's variables. A `pull_request` job reads
+`SDK_SHADOW_PR_RUNNER_<PLATFORM>` instead (`SDK_SHADOW_PR_RUNNER_LINUX_X64`,
+`SDK_SHADOW_PR_RUNNER_WINDOWS_X64`, `SDK_SHADOW_PR_RUNNER_MACOS`) and never
+falls back to the `main` label.
+
 - **Boss Room** runs Unity `6000.0.52f1` in GameCI's editor image for each
   player's build module, pinned by digest.
   [GameCI images](https://game.ci/docs/docker/docker-images)
@@ -96,6 +103,19 @@ platform job:
   standard runners have 14 GB of guaranteed disk, so these jobs need a
   larger runner with a custom image or a self-hosted runner. The plan
   fails and names the variable when it is unset.
+- **The lanes never share a named runner.** A pull-request job runs
+  unmerged code with the runner's privileges. A persistent runner can keep
+  a process or a changed toolchain (Go, `age`, Python, the engine) from
+  that job, and the next `main` job on it would expose the `main` source
+  identity. The plan refuses a label equal to the other lane's, ignoring
+  case, and refuses the labels every self-hosted runner carries
+  (`self-hosted`, `linux`, `windows`, `macos`, `x64`, `arm`, `arm64`).
+  Labels cannot prove which machines carry them, so no runner may carry
+  both a pull-request label and a `main` label, in this or any other
+  destination. Prefer ephemeral just-in-time runners, which take one job
+  each. A larger runner is a fresh VM per job, but the pull-request lane
+  still needs its own runner definition, so its label differs.
+  [Just-in-time runners](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#just-in-time-runners)
 
 The engine secrets reach only the step that installs or activates the
 engine, never the reconstruction or build steps. A pull-request build can
